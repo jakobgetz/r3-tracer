@@ -1,7 +1,7 @@
 use anyhow::Result;
 use walrus::{
-    ir::{self, Instr, MemArg, StoreKind, Visitor},
-    FunctionBuilder, GlobalId, InstrLocId, Local, LocalFunction, LocalId, MemoryId, Module,
+    ir::{self, Instr, MemArg, StoreKind},
+    FunctionBuilder, GlobalId, InstrSeqBuilder, Local, LocalFunction, LocalId, MemoryId, Module,
     ModuleConfig, ValType,
 };
 use wasm_bindgen::prelude::*;
@@ -14,24 +14,17 @@ pub fn instrument_wasm_js(buffer: &[u8]) -> Result<JsValue, JsValue> {
 }
 
 pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
-    let module = Module::from_buffer(buffer)?;
+    let mut module = Module::from_buffer(buffer)?;
     let mut new_module = Module::with_config(ModuleConfig::new());
-    let trace_mem_id = new_module.memories.add_local(true, 100, None);
-    let mem_pointer = new_module.globals.add_local(
-        walrus::ValType::I32,
-        true,
-        walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
-    );
-    let mut generator = Generator::new(new_module, trace_mem_id, mem_pointer);
+    new_module.memories = module.memories;
+    new_module.locals = module.locals;
+    new_module.tables = module.tables;
+    new_module.globals = module.globals;
+    let mut generator = Generator::new(new_module);
     module
         .funcs
-        .iter_local()
+        .iter_local_mut()
         .for_each(|(_, f)| generator.build(f));
-
-    generator.module.memories = module.memories;
-    generator.module.locals = module.locals;
-    generator.module.tables = module.tables;
-    generator.module.globals = module.globals;
 
     Ok(generator.module)
 }
@@ -44,17 +37,153 @@ struct Generator {
 }
 
 impl Generator {
-    fn new(module: Module, trace_mem_id: MemoryId, mem_pointer: GlobalId) -> Self {
+    fn new(mut module: Module) -> Self {
         Self {
+            trace_mem_id: module.memories.add_local(false, 100, None),
+            mem_pointer: module.globals.add_local(
+                walrus::ValType::I32,
+                true,
+                walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
+            ),
             module,
-            trace_mem_id,
-            mem_pointer,
             added_locals: Vec::new(),
         }
     }
 
-    fn build(&mut self, func: &LocalFunction) {
-        ir::dfs_in_order(self, func, func.entry_block());
+    fn build(&mut self, func: &mut LocalFunction) {
+        let mut builder = FunctionBuilder::new(&mut self.module.types, &[], &[]);
+        let mut new_body = builder.func_body();
+        let body = func.builder_mut().func_body();
+        let instrs = body.instrs();
+        for (instr_ref, _) in instrs {
+            let instr = instr_ref.clone();
+            match instr {
+                Instr::Call(_) => todo!(),
+                Instr::CallIndirect(_) => todo!(),
+                Instr::GlobalGet(_) => todo!(),
+                Instr::GlobalSet(_) => todo!(),
+                Instr::Return(_) => todo!(),
+                Instr::MemoryGrow(_) => todo!(),
+                Instr::MemoryInit(_) => todo!(),
+                Instr::DataDrop(_) => todo!(),
+                Instr::MemoryCopy(_) => todo!(),
+                Instr::MemoryFill(_) => todo!(),
+                Instr::Load(load) => {
+                    let (opcode, locals, byte_length) = match load.kind {
+                        ir::LoadKind::I32 { .. } => (0x28, &[ValType::I32], 4),
+                        ir::LoadKind::I64 { .. } => (0x29, &[ValType::I32], 8),
+                        ir::LoadKind::F32 => (0x2A, &[ValType::I32], 4),
+                        ir::LoadKind::F64 => (0x2B, &[ValType::I32], 8),
+                        ir::LoadKind::V128 => todo!(),
+                        ir::LoadKind::I32_8 { .. } => (0x2C, &[ValType::I32], 1),
+                        ir::LoadKind::I32_16 { .. } => (0x2E, &[ValType::I32], 2),
+                        ir::LoadKind::I64_8 { .. } => (0x30, &[ValType::I32], 1),
+                        ir::LoadKind::I64_16 { .. } => (0x32, &[ValType::I32], 2),
+                        ir::LoadKind::I64_32 { .. } => (0x34, &[ValType::I32], 4),
+                    };
+                    let locals = self.add_fresh_locals(locals);
+                    new_body
+                        .global_get(self.mem_pointer)
+                        .i32_const(opcode)
+                        .store(
+                            self.trace_mem_id,
+                            ir::StoreKind::I32_8 { atomic: false },
+                            MemArg {
+                                offset: 0,
+                                align: 0,
+                            },
+                        )
+                        .global_get(self.mem_pointer)
+                        .local_tee(*locals.get(0).unwrap())
+                        .store(
+                            self.trace_mem_id,
+                            to_store_kind(byte_length),
+                            MemArg {
+                                offset: 1,
+                                align: 0,
+                            },
+                        )
+                        .global_get(self.mem_pointer)
+                        .local_tee(*locals.get(1).unwrap())
+                        .store(
+                            self.trace_mem_id,
+                            ir::StoreKind::I32 { atomic: false },
+                            MemArg {
+                                offset: 1 + byte_length,
+                                align: 0,
+                            },
+                        );
+                    self.increment_mem_pointer(&mut new_body, 5 + byte_length as i32);
+                    new_body
+                        .local_get(*locals.get(1).unwrap())
+                        .local_get(*locals.get(0).unwrap())
+                        .instr(load);
+                }
+                Instr::Store(store) => {
+                    let (opcode, locals, byte_length) = match store.kind {
+                        ir::StoreKind::I32 { .. } => (0x36, &[ValType::I32, ValType::I32], 4),
+                        ir::StoreKind::I64 { .. } => (0x37, &[ValType::I32, ValType::I64], 8),
+                        ir::StoreKind::F32 => (0x38, &[ValType::I32, ValType::F32], 4),
+                        ir::StoreKind::F64 => (0x39, &[ValType::I32, ValType::F64], 8),
+                        ir::StoreKind::V128 => todo!(),
+                        ir::StoreKind::I32_8 { .. } => (0x3A, &[ValType::I32, ValType::I32], 1),
+                        ir::StoreKind::I32_16 { .. } => (0x3B, &[ValType::I32, ValType::I32], 2),
+                        ir::StoreKind::I64_8 { .. } => (0x3C, &[ValType::I32, ValType::I64], 1),
+                        ir::StoreKind::I64_16 { .. } => (0x3D, &[ValType::I32, ValType::I64], 2),
+                        ir::StoreKind::I64_32 { .. } => (0x3E, &[ValType::I32, ValType::I64], 4),
+                    };
+                    let locals = self.add_fresh_locals(locals);
+                    new_body
+                        .global_get(self.mem_pointer)
+                        .i32_const(opcode)
+                        .store(
+                            self.trace_mem_id,
+                            ir::StoreKind::I32_8 { atomic: false },
+                            MemArg {
+                                offset: 0,
+                                align: 0,
+                            },
+                        )
+                        .global_get(self.mem_pointer)
+                        .local_tee(*locals.get(0).unwrap())
+                        .store(
+                            self.trace_mem_id,
+                            store.kind,
+                            MemArg {
+                                offset: 1,
+                                align: 0,
+                            },
+                        )
+                        .global_get(self.mem_pointer)
+                        .local_tee(*locals.get(1).unwrap())
+                        .store(
+                            self.trace_mem_id,
+                            ir::StoreKind::I32 { atomic: false },
+                            MemArg {
+                                offset: 1 + byte_length,
+                                align: 0,
+                            },
+                        );
+                    self.increment_mem_pointer(&mut new_body, 5 + byte_length as i32);
+                    new_body
+                        .local_get(*locals.get(1).unwrap())
+                        .local_get(*locals.get(0).unwrap())
+                        .instr(store);
+                }
+                Instr::TableGet(_) => todo!(),
+                Instr::TableSet(_) => todo!(),
+                Instr::TableGrow(_) => todo!(),
+                Instr::TableFill(_) => todo!(),
+                Instr::LoadSimd(_) => todo!(),
+                Instr::TableInit(_) => todo!(),
+                Instr::ElemDrop(_) => todo!(),
+                Instr::TableCopy(_) => todo!(),
+                _ => {
+                    new_body.instr(instr);
+                }
+            }
+        }
+        builder.finish(func.args.clone(), &mut self.module.funcs);
     }
 
     fn add_fresh_locals(&mut self, types: &[ValType]) -> Vec<LocalId> {
@@ -84,125 +213,21 @@ impl Generator {
             })
             .collect()
     }
-}
 
-impl Visitor<'_> for Generator {
-    fn visit_instr(&mut self, instr: &Instr, _instr_loc: &InstrLocId) {
-        let mut builder = FunctionBuilder::new(&mut self.module.types, &[], &[]);
-        let mut body = builder.func_body();
-        match instr {
-            Instr::Call(_) => todo!(),
-            Instr::CallIndirect(_) => todo!(),
-            Instr::GlobalGet(_) => todo!(),
-            Instr::GlobalSet(_) => todo!(),
-            Instr::Return(_) => todo!(),
-            Instr::MemoryGrow(_) => todo!(),
-            Instr::MemoryInit(_) => todo!(),
-            Instr::DataDrop(_) => todo!(),
-            Instr::MemoryCopy(_) => todo!(),
-            Instr::MemoryFill(_) => todo!(),
-            Instr::Load(_) => todo!(),
-            Instr::Store(store) => {
-                let (opcode, locals) = match store.kind {
-                    ir::StoreKind::I32 { .. } => (0x15, &[ValType::I32, ValType::I32]),
-                    ir::StoreKind::I64 { .. } => todo!(),
-                    ir::StoreKind::F32 => todo!(),
-                    ir::StoreKind::F64 => todo!(),
-                    ir::StoreKind::V128 => todo!(),
-                    ir::StoreKind::I32_8 { .. } => todo!(),
-                    ir::StoreKind::I32_16 { .. } => todo!(),
-                    ir::StoreKind::I64_8 { .. } => todo!(),
-                    ir::StoreKind::I64_16 { .. } => todo!(),
-                    ir::StoreKind::I64_32 { .. } => todo!(),
-                };
-                let locals = self.add_fresh_locals(locals);
-                body.i32_const(opcode)
-                    .store(
-                        self.trace_mem_id,
-                        ir::StoreKind::I32_8 { atomic: false },
-                        MemArg {
-                            offset: 0,
-                            align: 1,
-                        },
-                    )
-                    .global_get(self.mem_pointer)
-                    .local_tee(*locals.get(0).unwrap())
-                    .store(
-                        self.trace_mem_id,
-                        ir::StoreKind::I32 { atomic: false },
-                        MemArg {
-                            offset: 1,
-                            align: 1,
-                        },
-                    )
-                    .global_get(self.mem_pointer)
-                    .local_tee(*locals.get(1).unwrap())
-                    .store(self.trace_mem_id, store.kind, store.arg)
-                    .global_get(self.mem_pointer)
-                    .i32_const(5 + store_byte_length(store.kind))
-                    .binop(ir::BinaryOp::I32Add)
-                    .global_set(self.mem_pointer)
-                    .local_get(*locals.get(0).unwrap())
-                    .local_get(*locals.get(1).unwrap())
-                    .instr(ir::Store {
-                        memory: store.memory,
-                        kind: store.kind,
-                        arg: store.arg,
-                    });
-            }
-            Instr::TableGet(_) => todo!(),
-            Instr::TableSet(_) => todo!(),
-            Instr::TableGrow(_) => todo!(),
-            Instr::TableFill(_) => todo!(),
-            Instr::RefNull(_) => todo!(),
-            Instr::LoadSimd(_) => todo!(),
-            Instr::TableInit(_) => todo!(),
-            Instr::ElemDrop(_) => todo!(),
-            Instr::TableCopy(_) => todo!(),
-            Instr::Block(_) => todo!(),
-            Instr::Loop(_) => todo!(),
-            Instr::LocalGet(_) => todo!(),
-            Instr::LocalSet(_) => todo!(),
-            Instr::LocalTee(_) => todo!(),
-            Instr::Const(instr) => {
-                body.const_(instr.value);
-            }
-            Instr::Binop(_) => todo!(),
-            Instr::Unop(_) => todo!(),
-            Instr::Select(_) => todo!(),
-            Instr::Unreachable(_) => todo!(),
-            Instr::Br(_) => todo!(),
-            Instr::BrIf(_) => todo!(),
-            Instr::IfElse(_) => todo!(),
-            Instr::BrTable(_) => todo!(),
-            Instr::Drop(_) => todo!(),
-            Instr::MemorySize(_) => todo!(),
-            Instr::AtomicRmw(_) => todo!(),
-            Instr::Cmpxchg(_) => todo!(),
-            Instr::AtomicNotify(_) => todo!(),
-            Instr::AtomicWait(_) => todo!(),
-            Instr::AtomicFence(_) => todo!(),
-            Instr::TableSize(_) => todo!(),
-            Instr::RefIsNull(_) => todo!(),
-            Instr::RefFunc(_) => todo!(),
-            Instr::V128Bitselect(_) => todo!(),
-            Instr::I8x16Swizzle(_) => todo!(),
-            Instr::I8x16Shuffle(_) => todo!(),
-        }
+    fn increment_mem_pointer(&self, seq: &mut InstrSeqBuilder, amount: i32) {
+        seq.global_get(self.mem_pointer)
+            .i32_const(amount)
+            .binop(ir::BinaryOp::I32Add)
+            .global_set(self.mem_pointer);
     }
 }
 
-fn store_byte_length(kind: StoreKind) -> i32 {
-    match kind {
-        StoreKind::I32 { .. } => 4,
-        StoreKind::I64 { .. } => 8,
-        StoreKind::F32 => 4,
-        StoreKind::F64 => 8,
-        StoreKind::V128 => todo!(),
-        StoreKind::I32_8 { .. } => 1,
-        StoreKind::I32_16 { .. } => 2,
-        StoreKind::I64_8 { .. } => 1,
-        StoreKind::I64_16 { .. } => 2,
-        StoreKind::I64_32 { .. } => 4,
+fn to_store_kind(byte_length: u32) -> StoreKind {
+    match byte_length {
+        1 => StoreKind::I32_8 { atomic: false },
+        2 => StoreKind::I32_16 { atomic: false },
+        4 => StoreKind::I32 { atomic: false },
+        8 => StoreKind::I64 { atomic: false },
+        _ => panic!(),
     }
 }
