@@ -12,7 +12,9 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub fn instrument_wasm_js(buffer: &[u8]) -> Result<JsValue, JsValue> {
     let mut module = instrument_wasm(buffer).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(serde_wasm_bindgen::to_value(&module.emit_wasm())?)
+    println!("we come until here");
+    let value = serde_wasm_bindgen::to_value(&module.emit_wasm())?;
+    Ok(value)
 }
 
 pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
@@ -23,14 +25,19 @@ pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
     new_module.tables = module.tables;
     new_module.globals = module.globals;
     let mut generator = Generator::new(new_module);
+    println!("so far");
     module
         .funcs
         .iter_local_mut()
         .for_each(|(_, f)| generator.build(f));
-
-    Ok(generator.module)
+    println!("here it works still");
+    println!("{:?}", generator.module);
+    let mody = generator.module;
+    println!("Hey");
+    Ok(mody)
 }
 
+#[derive(Debug)]
 struct Generator {
     trace_mem_id: MemoryId,
     mem_pointer: GlobalId,
@@ -60,188 +67,187 @@ impl Generator {
         for (instr_ref, _) in instrs {
             let instr = instr_ref.clone();
             match instr {
-                Instr::Call(_) => {
-                    self.trace_call(&mut seq, instr);
-                }
-                Instr::CallIndirect(c) => {
-                    self.trace_table_get(&mut seq, c.table);
-                    self.trace_call(&mut seq, Instr::CallIndirect(c));
-                }
-                Instr::GlobalGet(get) => {
-                    // seq.i32_const(0);
-                    self.trace_code(&mut seq, 0x23);
-                    let global_type = self.module.globals.get(get.global).ty;
-                    let (store_kind, byte_length) = store_info(global_type);
-                    let locals = self.add_locals(&[global_type]);
-                    seq.global_get(self.mem_pointer)
-                        .i32_const(get.global.index() as i32)
-                        .store(
-                            self.trace_mem_id,
-                            StoreKind::I32 { atomic: false },
-                            MemArg {
-                                offset: 1,
-                                align: 0,
-                            },
-                        )
-                        .instr(GlobalGet { global: get.global })
-                        .local_tee(*locals.get(0).unwrap())
-                        .global_get(self.mem_pointer)
-                        .local_get(*locals.get(0).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            store_kind,
-                            MemArg {
-                                offset: 5,
-                                align: 0,
-                            },
-                        );
-                    self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
-                }
-                Instr::GlobalSet(set) => {
-                    self.trace_code(&mut seq, 0x24);
-                    let global_type = self.module.globals.get(set.global).ty;
-                    let (store_kind, byte_length) = store_info(global_type);
-                    let locals = self.add_locals(&[global_type]);
-                    seq.local_set(*locals.get(0).unwrap())
-                        .global_get(self.mem_pointer)
-                        .local_get(*locals.get(0).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            store_kind,
-                            MemArg {
-                                offset: 1,
-                                align: 0,
-                            },
-                        )
-                        .local_get(*locals.get(0).unwrap())
-                        .instr(GlobalSet { global: set.global });
-                    self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
-                }
-                Instr::Return(_) => todo!(),
-                Instr::MemoryGrow(_) => todo!(),
-                Instr::MemoryInit(_) => todo!(),
-                Instr::DataDrop(_) => todo!(),
-                Instr::MemoryCopy(_) => todo!(),
-                Instr::MemoryFill(_) => todo!(),
-                Instr::Load(load) => {
-                    let (opcode, locals, byte_length) = match load.kind {
-                        ir::LoadKind::I32 { .. } => (0x28, &[ValType::I32], 4),
-                        ir::LoadKind::I64 { .. } => (0x29, &[ValType::I32], 8),
-                        ir::LoadKind::F32 => (0x2A, &[ValType::I32], 4),
-                        ir::LoadKind::F64 => (0x2B, &[ValType::I32], 8),
-                        ir::LoadKind::V128 => todo!(),
-                        ir::LoadKind::I32_8 { .. } => (0x2C, &[ValType::I32], 1),
-                        ir::LoadKind::I32_16 { .. } => (0x2E, &[ValType::I32], 2),
-                        ir::LoadKind::I64_8 { .. } => (0x30, &[ValType::I32], 1),
-                        ir::LoadKind::I64_16 { .. } => (0x32, &[ValType::I32], 2),
-                        ir::LoadKind::I64_32 { .. } => (0x34, &[ValType::I32], 4),
-                    };
-                    let locals = self.add_locals(locals);
-                    self.trace_code(&mut seq, opcode);
-                    seq.local_tee(*locals.get(0).unwrap())
-                        .global_get(self.mem_pointer)
-                        .local_get(*locals.get(0).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            to_store_kind(byte_length),
-                            MemArg {
-                                offset: 1,
-                                align: 0,
-                            },
-                        )
-                        .instr(load)
-                        .local_tee(*locals.get(1).unwrap())
-                        .global_get(self.mem_pointer)
-                        .store(
-                            self.trace_mem_id,
-                            ir::StoreKind::I32 { atomic: false },
-                            MemArg {
-                                offset: 1 + byte_length,
-                                align: 0,
-                            },
-                        );
-                    self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
-                    seq.local_get(*locals.get(1).unwrap())
-                        .local_get(*locals.get(0).unwrap());
-                }
-                Instr::Store(store) => {
-                    let (opcode, locals, byte_length) = match store.kind {
-                        ir::StoreKind::I32 { .. } => (0x36, &[ValType::I32, ValType::I32], 4),
-                        ir::StoreKind::I64 { .. } => (0x37, &[ValType::I32, ValType::I64], 8),
-                        ir::StoreKind::F32 => (0x38, &[ValType::I32, ValType::F32], 4),
-                        ir::StoreKind::F64 => (0x39, &[ValType::I32, ValType::F64], 8),
-                        ir::StoreKind::V128 => todo!(),
-                        ir::StoreKind::I32_8 { .. } => (0x3A, &[ValType::I32, ValType::I32], 1),
-                        ir::StoreKind::I32_16 { .. } => (0x3B, &[ValType::I32, ValType::I32], 2),
-                        ir::StoreKind::I64_8 { .. } => (0x3C, &[ValType::I32, ValType::I64], 1),
-                        ir::StoreKind::I64_16 { .. } => (0x3D, &[ValType::I32, ValType::I64], 2),
-                        ir::StoreKind::I64_32 { .. } => (0x3E, &[ValType::I32, ValType::I64], 4),
-                    };
-                    let locals = self.add_locals(locals);
-                    self.trace_code(&mut seq, opcode);
-                    seq.global_get(self.mem_pointer)
-                        .local_tee(*locals.get(0).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            store.kind,
-                            MemArg {
-                                offset: 1,
-                                align: 0,
-                            },
-                        )
-                        .global_get(self.mem_pointer)
-                        .local_tee(*locals.get(1).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            ir::StoreKind::I32 { atomic: false },
-                            MemArg {
-                                offset: 1 + byte_length,
-                                align: 0,
-                            },
-                        );
-                    self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
-                    seq.local_get(*locals.get(1).unwrap())
-                        .local_get(*locals.get(0).unwrap())
-                        .instr(store);
-                }
-                Instr::TableGet(get) => {
-                    self.trace_table_get(&mut seq, get.table);
-                }
-                Instr::TableSet(set) => {
-                    self.trace_code(&mut seq, 0x26);
-                    let table_type = self.module.tables.get(set.table).element_ty;
-                    let locals = self.add_locals(&[ValType::I32, table_type]);
-                    seq.global_get(self.mem_pointer)
-                        .local_tee(*locals.get(0).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            StoreKind::I32 { atomic: false },
-                            MemArg {
-                                offset: 1,
-                                align: 0,
-                            },
-                        )
-                        .instr(TableSet { table: set.table })
-                        .local_set(*locals.get(1).unwrap())
-                        .global_get(self.mem_pointer)
-                        .local_get(*locals.get(1).unwrap())
-                        .store(
-                            self.trace_mem_id,
-                            store_info(table_type).0,
-                            MemArg {
-                                offset: 5,
-                                align: 0,
-                            },
-                        )
-                        .local_get(*locals.get(1).unwrap());
-                    self.increment_mem_pointer(&mut seq, 5 + store_info(table_type).1 as i32);
-                }
-                Instr::TableGrow(_) => todo!(),
-                Instr::TableFill(_) => todo!(),
-                Instr::LoadSimd(_) => todo!(),
-                Instr::TableInit(_) => todo!(),
-                Instr::ElemDrop(_) => todo!(),
-                Instr::TableCopy(_) => todo!(),
+                // Instr::Call(_) => {
+                //     self.trace_call(&mut seq, instr);
+                // }
+                // Instr::CallIndirect(c) => {
+                //     self.trace_table_get(&mut seq, c.table);
+                //     self.trace_call(&mut seq, Instr::CallIndirect(c));
+                // }
+                // Instr::GlobalGet(get) => {
+                //     // seq.i32_const(0);
+                //     self.trace_code(&mut seq, 0x23);
+                //     let global_type = self.module.globals.get(get.global).ty;
+                //     let (store_kind, byte_length) = store_info(global_type);
+                //     let locals = self.add_locals(&[global_type]);
+                //     seq.global_get(self.mem_pointer)
+                //         .i32_const(get.global.index() as i32)
+                //         .store(
+                //             self.trace_mem_id,
+                //             StoreKind::I32 { atomic: false },
+                //             MemArg {
+                //                 offset: 1,
+                //                 align: 0,
+                //             },
+                //         )
+                //         .instr(GlobalGet { global: get.global })
+                //         .local_tee(*locals.get(0).unwrap())
+                //         .global_get(self.mem_pointer)
+                //         .local_get(*locals.get(0).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             store_kind,
+                //             MemArg {
+                //                 offset: 5,
+                //                 align: 0,
+                //             },
+                //         );
+                //     self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
+                // }
+                // Instr::GlobalSet(set) => {
+                //     self.trace_code(&mut seq, 0x24);
+                //     let global_type = self.module.globals.get(set.global).ty;
+                //     let (store_kind, byte_length) = store_info(global_type);
+                //     let locals = self.add_locals(&[global_type]);
+                //     seq.local_set(*locals.get(0).unwrap())
+                //         .global_get(self.mem_pointer)
+                //         .local_get(*locals.get(0).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             store_kind,
+                //             MemArg {
+                //                 offset: 1,
+                //                 align: 0,
+                //             },
+                //         )
+                //         .local_get(*locals.get(0).unwrap())
+                //         .instr(GlobalSet { global: set.global });
+                //     self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
+                // }
+                // Instr::Return(_) => todo!(),
+                // Instr::MemoryGrow(_) => todo!(),
+                // Instr::MemoryInit(_) => todo!(),
+                // Instr::DataDrop(_) => todo!(),
+                // Instr::MemoryCopy(_) => todo!(),
+                // Instr::MemoryFill(_) => todo!(),
+                // Instr::Load(load) => {
+                //     let (opcode, locals, byte_length) = match load.kind {
+                //         ir::LoadKind::I32 { .. } => (0x28, &[ValType::I32, ValType::I32], 4),
+                //         ir::LoadKind::I64 { .. } => (0x29, &[ValType::I32, ValType::I64], 8),
+                //         ir::LoadKind::F32 => (0x2A, &[ValType::I32, ValType::F32], 4),
+                //         ir::LoadKind::F64 => (0x2B, &[ValType::I32, ValType::F64], 8),
+                //         ir::LoadKind::V128 => todo!(),
+                //         ir::LoadKind::I32_8 { .. } => (0x2C, &[ValType::I32, ValType::I32], 1),
+                //         ir::LoadKind::I32_16 { .. } => (0x2E, &[ValType::I32, ValType::I32], 2),
+                //         ir::LoadKind::I64_8 { .. } => (0x30, &[ValType::I32, ValType::I64], 1),
+                //         ir::LoadKind::I64_16 { .. } => (0x32, &[ValType::I32, ValType::I64], 2),
+                //         ir::LoadKind::I64_32 { .. } => (0x34, &[ValType::I32, ValType::I64], 4),
+                //     };
+                //     let locals = self.add_locals(locals);
+                //     self.trace_code(&mut seq, opcode);
+                //     seq.local_tee(*locals.get(0).unwrap())
+                //         .global_get(self.mem_pointer)
+                //         .local_get(*locals.get(0).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             to_store_kind(byte_length),
+                //             MemArg {
+                //                 offset: 1,
+                //                 align: 0,
+                //             },
+                //         )
+                //         .instr(load)
+                //         .local_tee(*locals.get(1).unwrap())
+                //         .global_get(self.mem_pointer)
+                //         .local_get(*locals.get(1).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             ir::StoreKind::I32 { atomic: false },
+                //             MemArg {
+                //                 offset: 1 + byte_length,
+                //                 align: 0,
+                //             },
+                //         );
+                //     self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
+                // }
+                // Instr::Store(store) => {
+                //     let (opcode, locals, byte_length) = match store.kind {
+                //         ir::StoreKind::I32 { .. } => (0x36, &[ValType::I32, ValType::I32], 4),
+                //         ir::StoreKind::I64 { .. } => (0x37, &[ValType::I32, ValType::I64], 8),
+                //         ir::StoreKind::F32 => (0x38, &[ValType::I32, ValType::F32], 4),
+                //         ir::StoreKind::F64 => (0x39, &[ValType::I32, ValType::F64], 8),
+                //         ir::StoreKind::V128 => todo!(),
+                //         ir::StoreKind::I32_8 { .. } => (0x3A, &[ValType::I32, ValType::I32], 1),
+                //         ir::StoreKind::I32_16 { .. } => (0x3B, &[ValType::I32, ValType::I32], 2),
+                //         ir::StoreKind::I64_8 { .. } => (0x3C, &[ValType::I32, ValType::I64], 1),
+                //         ir::StoreKind::I64_16 { .. } => (0x3D, &[ValType::I32, ValType::I64], 2),
+                //         ir::StoreKind::I64_32 { .. } => (0x3E, &[ValType::I32, ValType::I64], 4),
+                //     };
+                //     let locals = self.add_locals(locals);
+                //     self.trace_code(&mut seq, opcode);
+                //     seq.global_get(self.mem_pointer)
+                //         .local_tee(*locals.get(0).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             store.kind,
+                //             MemArg {
+                //                 offset: 1,
+                //                 align: 0,
+                //             },
+                //         )
+                //         .global_get(self.mem_pointer)
+                //         .local_tee(*locals.get(1).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             ir::StoreKind::I32 { atomic: false },
+                //             MemArg {
+                //                 offset: 1 + byte_length,
+                //                 align: 0,
+                //             },
+                //         );
+                //     self.increment_mem_pointer(&mut seq, 5 + byte_length as i32);
+                //     seq.local_get(*locals.get(1).unwrap())
+                //         .local_get(*locals.get(0).unwrap())
+                //         .instr(store);
+                // }
+                // Instr::TableGet(get) => {
+                //     self.trace_table_get(&mut seq, get.table);
+                // }
+                // Instr::TableSet(set) => {
+                //     self.trace_code(&mut seq, 0x26);
+                //     let table_type = self.module.tables.get(set.table).element_ty;
+                //     let locals = self.add_locals(&[ValType::I32, table_type]);
+                //     seq.global_get(self.mem_pointer)
+                //         .local_tee(*locals.get(0).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             StoreKind::I32 { atomic: false },
+                //             MemArg {
+                //                 offset: 1,
+                //                 align: 0,
+                //             },
+                //         )
+                //         .instr(TableSet { table: set.table })
+                //         .local_set(*locals.get(1).unwrap())
+                //         .global_get(self.mem_pointer)
+                //         .local_get(*locals.get(1).unwrap())
+                //         .store(
+                //             self.trace_mem_id,
+                //             store_info(table_type).0,
+                //             MemArg {
+                //                 offset: 5,
+                //                 align: 0,
+                //             },
+                //         )
+                //         .local_get(*locals.get(1).unwrap());
+                //     self.increment_mem_pointer(&mut seq, 5 + store_info(table_type).1 as i32);
+                // }
+                // Instr::TableGrow(_) => todo!(),
+                // Instr::TableFill(_) => todo!(),
+                // Instr::LoadSimd(_) => todo!(),
+                // Instr::TableInit(_) => todo!(),
+                // Instr::ElemDrop(_) => todo!(),
+                // Instr::TableCopy(_) => todo!(),
                 _ => {
                     seq.instr(instr);
                 }
