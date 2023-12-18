@@ -20,6 +20,27 @@ local.get $value
 ;; original_store
 ```
 
+## store
+```wasm
+global.get $mem_pointer
+i32.const 0x36
+i32.store8 $trace_mem offset=0
+local.set 0 ;; save value to local
+global.get $mem_pointer
+local.get 0
+i64.store16 $trace_mem offset=1
+local.tee 1 ;; store addr to local
+global.get $mem_pointer
+local.get 1
+i64.store16 $trace_mem offset=5
+local.get 0
+i64.store16
+global.get $mem_pointer ;; increment mem_pointer
+i32.const 7
+i32.add
+global.set $mem_pointer
+```
+
 ## load
 ```wasm
 global.get $mem_pointer
@@ -76,14 +97,17 @@ local.get $return_value1
 ## call
 ```wasm
 global.get $mem_pointer
-i32.const ;; code for call + type idx
+i32.const ;; code for call
 i32.store8 offset=0
 global.get $mem_pointer
-i32.const ;; func idx
+i32.const ;; type idx
 i32.store offset=1
+global.get $mem_pointer
+i32.const ;; func idx
+i32.store offset=5
 local.tee $arg_1
 global.get $mem_pointer
-i32.store offset=5
+i32.store offset=9
 ;; do the same for other args
 global.get $mem_pointer
 i32.const ;; args byte length
@@ -92,6 +116,33 @@ global.set $mem_pointer
 ;; ... retrieve all args
 local.get $arg_1
 call ;; func idx
+```
+
+## call
+```wasm
+global.get $mem_pointer
+i32.const 0x10
+i32.store8 $trace_mem offset=0
+global.get $mem_pointer
+i32.const 0 ;; type idx
+i32.store $trace_mem offset=1
+global.get $mem_pointer
+i32.const 0 ;; func idx
+i32.store $trace_mem offset=5
+local.tee 0 ;; save arg local
+global.get $mem_pointer
+local.get 1
+i32.store $trace_mem offset=9
+call 0
+local.tee 0 ;; save result to local
+global.get $mem_pointer
+local.get 0
+i32.store $trace_mem offset=13
+global.get $mem_pointer ;; increment mem_pointer
+i32.const 17
+i32.add
+global.set $mem_pointer
+
 ```
 
 ## table set

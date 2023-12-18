@@ -4,7 +4,9 @@ use std::fs;
 use r3_tracer::instrument_wasm;
 
 fn main() {
-    let mut module = instrument_wasm(&fs::read("./test.wasm").unwrap()).unwrap();
+    let test_name = "call";
+    let buffer = &fs::read(format!("../tests/{}.wasm", test_name)).unwrap();
+    let mut module = instrument_wasm(buffer).unwrap();
     // let _ = dbg!(&module);
-    let _ = module.emit_wasm_file("./instrumented.wasm");
+    let _ = module.emit_wasm_file(format!("../tests/{}-instrumented.wasm", test_name));
 }
