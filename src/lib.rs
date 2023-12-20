@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Result;
 use walrus::{
     ir::{
@@ -5,8 +7,8 @@ use walrus::{
         InstrSeq, InstrSeqId, LocalGet, LocalSet, LocalTee, MemArg, Store, StoreKind, TableGet,
         TableSet, Value, VisitorMut,
     },
-    FunctionBuilder, GlobalId, InstrLocId, InstrSeqBuilder, Local, LocalFunction, LocalId,
-    MemoryId, Module, ModuleConfig, TableId, ValType,
+    FunctionBuilder, FunctionKind, GlobalId, InstrLocId, InstrSeqBuilder, Local, LocalFunction,
+    LocalId, MemoryId, Module, ModuleConfig, TableId, ValType,
 };
 use wasm_bindgen::prelude::*;
 
@@ -15,51 +17,73 @@ type Instruction = (Instr, InstrLocId);
 #[wasm_bindgen]
 pub fn instrument_wasm_js(buffer: &[u8]) -> Result<JsValue, JsValue> {
     let mut module = instrument_wasm(buffer).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    println!("we come until here");
     let value = serde_wasm_bindgen::to_value(&module.emit_wasm())?;
     Ok(value)
 }
 
 pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
     let mut module = Module::from_buffer(buffer)?;
-    let _ = dbg!(&module);
-    let mut generator = Generator::new(module);
+    let trace_mem_id = module.memories.add_local(false, 100, None);
+    let mem_pointer = module.globals.add_local(
+        walrus::ValType::I32,
+        true,
+        walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
+    );
+    let added_locals = add_locals(&mut module);
+    let mut generator = Generator::new(trace_mem_id, mem_pointer, added_locals);
     module
         .funcs
         .iter_local_mut()
         .for_each(|(_, f)| ir::dfs_pre_order_mut(&mut generator, f, f.entry_block()));
-
-    // module
-    //     .funcs
-    //     .iter_local_mut()
-    //     .for_each(|(_, f)| generator.build(f));
-    // let mut mody = generator.module;
     Ok(module)
 }
 
-struct Instructions(Vec<InstructionsEnum>);
+type AddedLocals = HashMap<ValType, Vec<LocalId>>;
 
-impl Instructions {
-    fn flatten(&self) -> Vec<Instruction> {
-        let mut seq = vec![];
-        for instr in self.0.into_iter() {
-            match instr {
-                InstructionsEnum::Sequence(mut s) => seq.append(&mut s),
-                InstructionsEnum::Single(i) => seq.push(i),
+fn add_locals(module: &mut Module) -> HashMap<ValType, Vec<LocalId>> {
+    let mut added_locals: AddedLocals = HashMap::new();
+    [
+        ValType::I32,
+        ValType::I32,
+        ValType::I64,
+        ValType::F32,
+        ValType::F64,
+    ]
+    .into_iter()
+    .for_each(|t| {
+        match added_locals.get_mut(&t) {
+            Some(local) => local.push(module.locals.add(t)),
+            None => {
+                added_locals.insert(t, vec![module.locals.add(t)]);
             }
-        }
-        seq
-    }
+        };
+    });
+    added_locals
 }
 
 enum InstructionsEnum {
     Sequence(Vec<Instruction>),
-    Single(Instruction)
+    Single(Instruction),
 }
 
 impl InstructionsEnum {
-    fn from_vec(slice: Instructions) -> Self {
-        Self::Sequence(slice.flatten())
+    pub fn from_vec(vec: Vec<InstructionsEnum>) -> Self {
+        Self::Sequence(
+            vec.into_iter()
+                .map(|e| match e {
+                    InstructionsEnum::Sequence(s) => s,
+                    InstructionsEnum::Single(s) => vec![s],
+                })
+                .flat_map(|s| s.into_iter())
+                .collect(),
+        )
+    }
+
+    pub fn flatten(&self) -> Vec<Instruction> {
+        match self {
+            InstructionsEnum::Sequence(s) => s.to_vec(),
+            InstructionsEnum::Single(s) => vec![s.clone()],
+        }
     }
 }
 
@@ -67,59 +91,72 @@ impl InstructionsEnum {
 struct Generator {
     trace_mem_id: MemoryId,
     mem_pointer: GlobalId,
-    added_locals: Vec<Local>,
-    pub module: Module,
+    added_locals: AddedLocals,
 }
 
 impl VisitorMut for Generator {
+    fn visit_instr_seq_id_mut(&mut self, instr_seq_id: &mut InstrSeqId) {
+        println!("{:?}", instr_seq_id);
+    }
+
     fn start_instr_seq_mut(&mut self, seq: &mut ir::InstrSeq) {
         seq.clone().iter().enumerate().for_each(|(i, (instr, _))| {
-            let mut gen_seq: Vec<Instruction>;
+            let gen_seq: Vec<Instruction>;
             match instr {
                 Instr::Load(load) => {
-                    let (opcode, locals, byte_length) = match load.kind {
-                        ir::LoadKind::I32 { .. } => (0x28, &[ValType::I32, ValType::I32], 4),
-                        ir::LoadKind::I64 { .. } => (0x29, &[ValType::I32, ValType::I64], 8),
-                        ir::LoadKind::F32 => (0x2A, &[ValType::I32, ValType::F32], 4),
-                        ir::LoadKind::F64 => (0x2B, &[ValType::I32, ValType::F64], 8),
+                    let (opcode, local_type, byte_length) = match load.kind {
+                        ir::LoadKind::I32 { .. } => (0x28, ValType::I32, 4),
+                        ir::LoadKind::I64 { .. } => (0x29, ValType::I64, 8),
+                        ir::LoadKind::F32 => (0x2A, ValType::F32, 4),
+                        ir::LoadKind::F64 => (0x2B, ValType::F64, 8),
                         ir::LoadKind::V128 => todo!(),
-                        ir::LoadKind::I32_8 { .. } => (0x2C, &[ValType::I32, ValType::I32], 1),
-                        ir::LoadKind::I32_16 { .. } => (0x2E, &[ValType::I32, ValType::I32], 2),
-                        ir::LoadKind::I64_8 { .. } => (0x30, &[ValType::I32, ValType::I64], 1),
-                        ir::LoadKind::I64_16 { .. } => (0x32, &[ValType::I32, ValType::I64], 2),
-                        ir::LoadKind::I64_32 { .. } => (0x34, &[ValType::I32, ValType::I64], 4),
+                        ir::LoadKind::I32_8 { .. } => (0x2C, ValType::I32, 1),
+                        ir::LoadKind::I32_16 { .. } => (0x2E, ValType::I32, 2),
+                        ir::LoadKind::I64_8 { .. } => (0x30, ValType::I64, 1),
+                        ir::LoadKind::I64_16 { .. } => (0x32, ValType::I64, 2),
+                        ir::LoadKind::I64_32 { .. } => (0x34, ValType::I64, 4),
                     };
-                    let locals = self.add_locals(locals);
-                    let gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(seq, opcode),
-                        self.local_tee(*locals.get(0).unwrap()),
+                    gen_seq = InstructionsEnum::from_vec(vec![
+                        self.trace_code(opcode),
+                        self.local_tee(
+                            *self.added_locals.get(&local_type).unwrap().get(0).unwrap(),
+                        ),
                         self.global_get(self.mem_pointer),
+                        self.local_get(
+                            *self.added_locals.get(&local_type).unwrap().get(0).unwrap(),
+                        ),
                         self.store_to_trace(to_store_kind(byte_length), 1),
-                        self.instr(*instr),
-                        self.local_tee(*locals.get(1).unwrap()),
+                        self.instr(instr.clone()),
+                        self.local_tee(
+                            *self
+                                .added_locals
+                                .get(&ValType::I32)
+                                .unwrap()
+                                .get(0)
+                                .unwrap(),
+                        ),
                         self.global_get(self.mem_pointer),
+                        self.local_get(
+                            *self.added_locals.get(&local_type).unwrap().get(0).unwrap(),
+                        ),
                         self.store_to_trace(ir::StoreKind::I32 { atomic: false }, 1 + byte_length),
                         self.increment_mem_pointer(5 + byte_length as i32),
-                    ]).flatten();
+                    ])
+                    .flatten();
+                    seq.splice(i..(i + 1), gen_seq);
                 }
-                _ => return,
+                _ => {}
             };
-            seq.splice(i..(i + 1), gen_seq);
         })
     }
 }
 
 impl Generator {
-    fn new(mut module: Module) -> Self {
+    fn new(trace_mem_id: MemoryId, mem_pointer: GlobalId, added_locals: AddedLocals) -> Self {
         Self {
-            trace_mem_id: module.memories.add_local(false, 100, None),
-            mem_pointer: module.globals.add_local(
-                walrus::ValType::I32,
-                true,
-                walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
-            ),
-            module,
-            added_locals: Vec::new(),
+            trace_mem_id,
+            mem_pointer,
+            added_locals,
         }
     }
 
@@ -390,39 +427,11 @@ impl Generator {
         // builder.finish(func.args.clone(), &mut self.module.funcs);
     }
 
-    fn add_locals(&mut self, types: &[ValType]) -> Vec<LocalId> {
-        let mut unused_locals = self.added_locals.clone();
-        types
-            .into_iter()
-            .map(|typ| {
-                let local = match unused_locals.clone().into_iter().find(|l| l.ty() == *typ) {
-                    Some(local) => local,
-                    None => {
-                        let id = self.module.locals.add(*typ);
-                        self.module.locals.get(id).clone()
-                    }
-                };
-                if unused_locals.len() > 0 {
-                    let mut i = 0;
-                    for l in &unused_locals {
-                        if l == &local {
-                            break;
-                        }
-                        i += 1;
-                    }
-                    unused_locals.remove(i);
-                }
-                self.added_locals.push(local.clone());
-                local.id()
-            })
-            .collect()
-    }
-
-    fn trace_code(&self, seq: &mut InstrSeq, code: i32) -> InstructionsEnum {
-        InstructionsEnum::from_slice(&[
+    fn trace_code(&self, code: i32) -> InstructionsEnum {
+        InstructionsEnum::from_vec(vec![
+            self.global_get(self.mem_pointer),
             self.get_const(Value::I32(code)),
             self.store_to_trace(StoreKind::I32_8 { atomic: false }, 0),
-            self.global_get(self.mem_pointer)
         ])
     }
 
@@ -472,7 +481,7 @@ impl Generator {
     }
 
     fn increment_mem_pointer(&self, amount: i32) -> InstructionsEnum {
-        InstructionsEnum::from_slice(&[
+        InstructionsEnum::from_vec(vec![
             self.global_get(self.mem_pointer),
             self.get_const(Value::I32(amount)),
             self.binop(ir::BinaryOp::I32Add),
