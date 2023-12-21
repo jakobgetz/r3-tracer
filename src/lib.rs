@@ -311,12 +311,10 @@ impl VisitorMut for Generator {
                 Instr::MemoryFill(_) => todo!(),
                 _ => return,
             };
-            println!("{:?}", instr);
             let gen_length = gen_seq.len() - 1;
             instrumentation_code.push((i + added_instr_count, gen_seq));
             added_instr_count += gen_length;
         });
-        println!("{:?}", instrumentation_code.iter().map(|(i, _)| {i}).collect::<Vec<_>>());
         instrumentation_code.iter().for_each(|(i, gen_seq)| {
             seq.splice(i.clone()..(i.clone() + 1), gen_seq.clone());
         })
