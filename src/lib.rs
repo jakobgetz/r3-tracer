@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Debug};
 use anyhow::Result;
 use walrus::{
     ir::{
-        self, BinaryOp, Binop, Const, GlobalGet, GlobalSet, Instr, InstrSeqId, LocalGet, LocalSet,
+        self, BinaryOp, Binop, Const, GlobalGet, GlobalSet, Instr, LocalGet, LocalSet,
         LocalTee, MemArg, Store, StoreKind, Value, VisitorMut,
     },
     FunctionId, GlobalId, InstrLocId, LocalId, MemoryId, Module, TableId, Type, TypeId, ValType,
@@ -164,11 +164,9 @@ struct Generator {
 }
 
 impl VisitorMut for Generator {
-    fn visit_instr_seq_id_mut(&mut self, instr_seq_id: &mut InstrSeqId) {
-        println!("{:?}", instr_seq_id);
-    }
-
     fn start_instr_seq_mut(&mut self, seq: &mut ir::InstrSeq) {
+        let mut added_instr_count = 0;
+        let mut instrumentation_code = Vec::new();
         seq.clone().iter().enumerate().for_each(|(i, (instr, _))| {
             let gen_seq: Vec<Instruction>;
             let offset: &mut u32 = &mut 0;
@@ -313,7 +311,14 @@ impl VisitorMut for Generator {
                 Instr::MemoryFill(_) => todo!(),
                 _ => return,
             };
-            seq.splice(i..(i + 1), gen_seq);
+            println!("{:?}", instr);
+            let gen_length = gen_seq.len() - 1;
+            instrumentation_code.push((i + added_instr_count, gen_seq));
+            added_instr_count += gen_length;
+        });
+        println!("{:?}", instrumentation_code.iter().map(|(i, _)| {i}).collect::<Vec<_>>());
+        instrumentation_code.iter().for_each(|(i, gen_seq)| {
+            seq.splice(i.clone()..(i.clone() + 1), gen_seq.clone());
         })
     }
 }
