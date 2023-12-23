@@ -2,6 +2,7 @@
     "scripts": {
         "build": "wasm-pack build --debug -t web",
         "test-funky": "wat2wasm tests/funky-kart.wat -o tests/funky-kart.wasm && cargo run && wasm2wat tests/funky-kart-instrumented.wasm --enable-multi-memory -o tests/funky-kart-instrumented.wat",
-        "test-call-indirect": "wat2wasm tests/call_indirect.wat -o tests/call_indirect.wasm && cargo run && wasm2wat tests/call_indirect-instrumented.wasm --enable-multi-memory"
+        "test-call-indirect": "wat2wasm tests/call_indirect.wat -o tests/call_indirect.wasm && cargo run && wasm2wat tests/call_indirect-instrumented.wasm --enable-multi-memory",
+        "test-load": "wat2wasm tests/load.wat -o tests/load.wasm && cargo run && wasm2wat tests/load-instrumented.wasm --enable-multi-memory"
     }
 }
