@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Debug};
 use anyhow::Result;
 use walrus::{
     ir::{
-        self, BinaryOp, Binop, Const, GlobalGet, GlobalSet, Instr, LocalGet, LocalSet,
+        self, BinaryOp, Binop, Const, Drop, GlobalGet, GlobalSet, Instr, LocalGet, LocalSet,
         LocalTee, MemArg, Store, StoreKind, Value, VisitorMut,
     },
     FunctionId, GlobalId, InstrLocId, LocalId, MemoryId, Module, TableId, Type, TypeId, ValType,
@@ -243,7 +243,7 @@ impl VisitorMut for Generator {
                     let typ = self.module_types.get_by_id(&call.ty).unwrap().clone();
                     gen_seq = InstructionsEnum::from_vec(vec![
                         self.trace_code(opcode, offset),
-                        self.save_stack(typ.params(), offset),
+                        self.save_stack(&[typ.params(), &[ValType::I32]].concat(), offset),
                         self.instr(instr.clone()),
                         self.save_stack(typ.results(), offset),
                         self.increment_mem_pointer(*offset),
@@ -395,7 +395,7 @@ impl Generator {
         InstructionsEnum::from_vec(vec![
             self.global_get(self.mem_pointer),
             self.get_const(Value::I32(code)),
-            self.store_to_trace(StoreKind::I32 { atomic: false }, offset),
+            self.store_to_trace(StoreKind::I32_8 { atomic: false }, offset),
         ])
     }
 
