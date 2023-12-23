@@ -29,11 +29,22 @@ pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
     );
     let added_locals = add_locals(&mut module);
     let module_types = Types::new(&module);
-    let mut generator = Generator::new(trace_mem_id, mem_pointer, added_locals, module_types);
-    module
-        .funcs
-        .iter_local_mut()
-        .for_each(|(_, f)| ir::dfs_pre_order_mut(&mut generator, f, f.entry_block()));
+    let current_type = module
+        .types
+        .get(module.functions().find(|f| true).unwrap().ty())
+        .clone();
+    let mut generator = Generator::new(
+        trace_mem_id,
+        mem_pointer,
+        added_locals,
+        module_types,
+        current_type,
+    );
+    module.funcs.iter_local_mut().for_each(|(_, f)| {
+        generator.set_current_func_type(module.types.get(f.ty()).clone());
+        ir::dfs_pre_order_mut(&mut generator, f, f.entry_block())
+    });
+    // dbg!(&module);
     Ok(module)
 }
 
@@ -161,6 +172,7 @@ struct Generator {
     mem_pointer: GlobalId,
     added_locals: AddedLocals,
     module_types: Types,
+    current_func_type: Type,
 }
 
 impl VisitorMut for Generator {
@@ -208,9 +220,9 @@ impl VisitorMut for Generator {
                     };
                     gen_seq = InstructionsEnum::from_vec(vec![
                         self.trace_code(opcode, offset),
-                        self.save_stack(&[ValType::I32, local_type], offset),
+                        // self.save_stack(&[ValType::I32, local_type], offset),
                         self.instr(instr.clone()),
-                        self.increment_mem_pointer(*offset),
+                        // self.increment_mem_pointer(*offset),
                     ])
                     .flatten();
                 }
@@ -280,6 +292,7 @@ impl VisitorMut for Generator {
                         self.save_stack(&[ValType::I32], offset),
                         self.instr(instr.clone()),
                         self.save_stack(&[typ], offset),
+                        self.increment_mem_pointer(*offset),
                     ])
                     .flatten();
                 }
@@ -294,6 +307,7 @@ impl VisitorMut for Generator {
                         self.trace_code(opcode, offset),
                         self.save_stack(&[ValType::I32, typ], offset),
                         self.instr(instr.clone()),
+                        self.increment_mem_pointer(*offset),
                     ])
                     .flatten();
                 }
@@ -303,7 +317,18 @@ impl VisitorMut for Generator {
                 Instr::TableInit(_) => todo!(),
                 Instr::ElemDrop(_) => todo!(),
                 Instr::TableCopy(_) => todo!(),
-                Instr::Return(_) => todo!(),
+                Instr::Return(_) => {
+                    let opcode = 0x0F;
+                    let c = self.current_func_type.clone();
+                    let returns = c.results();
+                    gen_seq = InstructionsEnum::from_vec(vec![
+                        self.trace_code(opcode, offset),
+                        self.save_stack(returns, offset),
+                        self.instr(instr.clone()),
+                        self.increment_mem_pointer(*offset),
+                    ])
+                    .flatten();
+                }
                 Instr::MemoryGrow(_) => todo!(),
                 Instr::MemoryInit(_) => todo!(),
                 Instr::DataDrop(_) => todo!(),
@@ -327,12 +352,14 @@ impl Generator {
         mem_pointer: GlobalId,
         added_locals: AddedLocals,
         module_types: Types,
+        current_func_type: Type,
     ) -> Self {
         Self {
             trace_mem_id,
             mem_pointer,
             added_locals,
             module_types,
+            current_func_type,
         }
     }
 
@@ -368,7 +395,7 @@ impl Generator {
         InstructionsEnum::from_vec(vec![
             self.global_get(self.mem_pointer),
             self.get_const(Value::I32(code)),
-            self.store_to_trace(StoreKind::I32_8 { atomic: false }, offset),
+            self.store_to_trace(StoreKind::I32 { atomic: false }, offset),
         ])
     }
 
@@ -385,13 +412,33 @@ impl Generator {
         self.store_to_trace(kind, offset)
     }
 
+    // fn double_drop(&self) -> InstructionsEnum {
+    //     InstructionsEnum::from_vec(vec![self.drop(), self.drop()])
+    // }
+
+    // fn drop(&self) -> InstructionsEnum {
+    //     InstructionsEnum::Single((Instr::Drop(Drop {}), InstrLocId::default()))
+    // }
+
     fn store_to_trace(&self, kind: StoreKind, offset: &mut u32) -> InstructionsEnum {
+        let align = match kind {
+            StoreKind::I32 { .. } => 4,
+            StoreKind::I64 { .. } => 8,
+            StoreKind::F32 => 4,
+            StoreKind::F64 => 8,
+            StoreKind::V128 => todo!(),
+            StoreKind::I32_8 { .. } => 1,
+            StoreKind::I32_16 { .. } => 2,
+            StoreKind::I64_8 { .. } => 1,
+            StoreKind::I64_16 { .. } => 2,
+            StoreKind::I64_32 { .. } => 4,
+        };
         let instr = InstructionsEnum::Single((
             Instr::Store(Store {
                 memory: self.trace_mem_id,
                 kind,
                 arg: MemArg {
-                    align: 0,
+                    align,
                     offset: *offset,
                 },
             }),
@@ -410,6 +457,7 @@ impl Generator {
             StoreKind::I64_32 { .. } => *offset += 4,
         };
         instr
+        // self.double_drop()
     }
 
     fn instr(&self, instr: Instr) -> InstructionsEnum {
@@ -457,5 +505,9 @@ impl Generator {
 
     fn binop(&self, op: BinaryOp) -> InstructionsEnum {
         InstructionsEnum::Single((Instr::Binop(Binop { op }), InstrLocId::default()))
+    }
+
+    fn set_current_func_type(&mut self, typ: Type) {
+        self.current_func_type = typ;
     }
 }
