@@ -21,36 +21,38 @@ pub fn instrument_wasm_js(buffer: &[u8]) -> Result<JsValue, JsValue> {
 
 pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
     let mut module = Module::from_buffer(buffer)?;
-    let trace_mem_id = module.memories.add_local(false, 100, None);
+    let trace_mem_id = module.memories.add_local(false, 30000, None); // around 2 GB
     let mem_pointer = module.globals.add_local(
         walrus::ValType::I32,
         true,
         walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
     );
-    let added_locals = add_locals(&mut module);
+    let locals = add_locals(&mut module);
     let module_types = Types::new(&module);
     let current_type = module
         .types
-        .get(module.functions().find(|f| true).unwrap().ty())
+        .get(module.functions().find(|_| true).unwrap().ty())
         .clone();
     let mut generator = Generator::new(
         trace_mem_id,
         mem_pointer,
-        added_locals,
+        locals.0,
+        locals.1,
         module_types,
         current_type,
     );
     module.funcs.iter_local_mut().for_each(|(_, f)| {
         generator.set_current_func_type(module.types.get(f.ty()).clone());
+        generator.set_func_entry(true);
         ir::dfs_pre_order_mut(&mut generator, f, f.entry_block())
     });
     // dbg!(&module);
     Ok(module)
 }
 
-type AddedLocals = HashMap<ValType, Vec<LocalId>>;
-fn add_locals(module: &mut Module) -> HashMap<ValType, Vec<LocalId>> {
-    let mut added_locals: AddedLocals = HashMap::new();
+type Locals = HashMap<ValType, Vec<LocalId>>;
+fn add_locals(module: &mut Module) -> (Locals, Locals) {
+    let mut added_locals: Locals = HashMap::new();
     added_locals.insert(ValType::I32, vec![module.locals.add(ValType::I32)]);
     added_locals.insert(ValType::I64, vec![module.locals.add(ValType::I64)]);
     added_locals.insert(ValType::F32, vec![module.locals.add(ValType::F32)]);
@@ -88,7 +90,16 @@ fn add_locals(module: &mut Module) -> HashMap<ValType, Vec<LocalId>> {
             });
         });
     });
-    added_locals
+    let mut locals = HashMap::new();
+    module.locals.iter().for_each(|l| {
+        let _ = locals
+            .entry(l.ty())
+            .and_modify(|e: &mut Vec<LocalId>| {
+                e.push(l.id());
+            })
+            .or_insert(vec![l.id()]);
+    });
+    (locals, added_locals)
 }
 
 #[derive(Debug)]
@@ -170,9 +181,11 @@ impl InstructionsEnum {
 struct Generator {
     trace_mem_id: MemoryId,
     mem_pointer: GlobalId,
-    added_locals: AddedLocals,
+    locals: Locals,
+    added_locals: Locals,
     module_types: Types,
     current_func_type: Type,
+    func_entry: bool,
 }
 
 impl VisitorMut for Generator {
@@ -180,8 +193,21 @@ impl VisitorMut for Generator {
         let mut added_instr_count = 0;
         let mut instrumentation_code = Vec::new();
         seq.clone().iter().enumerate().for_each(|(i, (instr, _))| {
-            let gen_seq: Vec<Instruction>;
+            let mut gen_seq: Vec<Instruction> = vec![];
             let offset: &mut u32 = &mut 0;
+            if self.func_entry == true {
+                let opcode = 0x02;
+                let c = self.current_func_type.clone();
+                let params = c.params();
+                gen_seq.append(
+                    &mut InstructionsEnum::from_vec(vec![
+                        self.trace_code(opcode, offset),
+                        self.save_locals(params, offset),
+                        self.increment_mem_pointer(*offset),
+                    ])
+                    .flatten(),
+                );
+            }
             match instr {
                 Instr::Load(load) => {
                     let (opcode, local_type) = match load.kind {
@@ -196,14 +222,16 @@ impl VisitorMut for Generator {
                         ir::LoadKind::I64_16 { .. } => (0x32, ValType::I64),
                         ir::LoadKind::I64_32 { .. } => (0x34, ValType::I64),
                     };
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(&[ValType::I32], offset),
-                        self.instr(instr.clone()),
-                        self.save_stack(&[local_type], offset),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(&[ValType::I32], offset),
+                            self.instr(instr.clone()),
+                            self.save_stack(&[local_type], offset),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::Store(store) => {
                     let (opcode, local_type) = match store.kind {
@@ -218,37 +246,43 @@ impl VisitorMut for Generator {
                         ir::StoreKind::I64_16 { .. } => (0x3D, ValType::I64),
                         ir::StoreKind::I64_32 { .. } => (0x3E, ValType::I64),
                     };
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        // self.save_stack(&[ValType::I32, local_type], offset),
-                        self.instr(instr.clone()),
-                        // self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            // self.save_stack(&[ValType::I32, local_type], offset),
+                            self.instr(instr.clone()),
+                            // self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::Call(call) => {
                     let opcode = 0x10;
                     let typ = self.module_types.get_by_func(&call.func).unwrap().clone();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(typ.params(), offset),
-                        self.instr(instr.clone()),
-                        self.save_stack(typ.results(), offset),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(typ.params(), offset),
+                            self.instr(instr.clone()),
+                            self.save_stack(typ.results(), offset),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::CallIndirect(call) => {
                     let opcode = 0x11;
                     let typ = self.module_types.get_by_id(&call.ty).unwrap().clone();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(&[typ.params(), &[ValType::I32]].concat(), offset),
-                        self.instr(instr.clone()),
-                        self.save_stack(typ.results(), offset),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(&[typ.params(), &[ValType::I32]].concat(), offset),
+                            self.instr(instr.clone()),
+                            self.save_stack(typ.results(), offset),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::GlobalGet(g) => {
                     let opcode = 0x23;
@@ -257,13 +291,15 @@ impl VisitorMut for Generator {
                         .get_global_type(&g.global)
                         .unwrap()
                         .clone();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.instr(instr.clone()),
-                        self.save_stack(&[typ], offset),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.instr(instr.clone()),
+                            self.save_stack(&[typ], offset),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::GlobalSet(get) => {
                     let opcode = 0x23;
@@ -272,13 +308,15 @@ impl VisitorMut for Generator {
                         .get_global_type(&get.global)
                         .unwrap()
                         .clone();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(&[typ], offset),
-                        self.instr(instr.clone()),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(&[typ], offset),
+                            self.instr(instr.clone()),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::TableGet(set) => {
                     let opcode = 0x26;
@@ -287,14 +325,16 @@ impl VisitorMut for Generator {
                         .get_element_type(&set.table)
                         .unwrap()
                         .clone();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(&[ValType::I32], offset),
-                        self.instr(instr.clone()),
-                        self.save_stack(&[typ], offset),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(&[ValType::I32], offset),
+                            self.instr(instr.clone()),
+                            self.save_stack(&[typ], offset),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::TableSet(set) => {
                     let opcode = 0x26;
@@ -303,13 +343,15 @@ impl VisitorMut for Generator {
                         .get_element_type(&set.table)
                         .unwrap()
                         .clone();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(&[ValType::I32, typ], offset),
-                        self.instr(instr.clone()),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(&[ValType::I32, typ], offset),
+                            self.instr(instr.clone()),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::TableGrow(_) => todo!(),
                 Instr::TableFill(_) => todo!(),
@@ -321,13 +363,15 @@ impl VisitorMut for Generator {
                     let opcode = 0x0F;
                     let c = self.current_func_type.clone();
                     let returns = c.results();
-                    gen_seq = InstructionsEnum::from_vec(vec![
-                        self.trace_code(opcode, offset),
-                        self.save_stack(returns, offset),
-                        self.instr(instr.clone()),
-                        self.increment_mem_pointer(*offset),
-                    ])
-                    .flatten();
+                    gen_seq.append(
+                        &mut InstructionsEnum::from_vec(vec![
+                            self.trace_code(opcode, offset),
+                            self.save_stack(returns, offset),
+                            self.instr(instr.clone()),
+                            self.increment_mem_pointer(*offset),
+                        ])
+                        .flatten(),
+                    );
                 }
                 Instr::MemoryGrow(_) => todo!(),
                 Instr::MemoryInit(_) => todo!(),
@@ -350,17 +394,43 @@ impl Generator {
     fn new(
         trace_mem_id: MemoryId,
         mem_pointer: GlobalId,
-        added_locals: AddedLocals,
+        locals: Locals,
+        added_locals: Locals,
         module_types: Types,
         current_func_type: Type,
     ) -> Self {
         Self {
             trace_mem_id,
             mem_pointer,
+            locals,
             added_locals,
             module_types,
             current_func_type,
+            func_entry: true,
         }
+    }
+
+    fn save_locals(&mut self, values: &[ValType], offset: &mut u32) -> InstructionsEnum {
+        let mut locals = Vec::new();
+        InstructionsEnum::from_vec(
+            values
+                .iter()
+                .map(|t| {
+                    let local = *self.added_locals.get(t).unwrap().get(0).unwrap();
+                    locals.push(local);
+                    self.locals.entry(*t).and_modify(|e| {
+                        let id = e.remove(0);
+                        e.push(id);
+                    });
+                    let instrs = InstructionsEnum::from_vec(vec![
+                        self.global_get(self.mem_pointer),
+                        self.local_get(local),
+                        self.store_val_to_trace(*t, offset),
+                    ]);
+                    instrs
+                })
+                .collect(),
+        )
     }
 
     fn save_stack(&mut self, values: &[ValType], offset: &mut u32) -> InstructionsEnum {
@@ -509,5 +579,9 @@ impl Generator {
 
     fn set_current_func_type(&mut self, typ: Type) {
         self.current_func_type = typ;
+    }
+
+    fn set_func_entry(&mut self, entry: bool) {
+        self.func_entry = entry;
     }
 }
