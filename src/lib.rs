@@ -3,8 +3,8 @@ use std::{collections::HashMap, fmt::Debug};
 use anyhow::Result;
 use walrus::{
     ir::{
-        self, BinaryOp, Binop, Const, Drop, GlobalGet, GlobalSet, Instr, LocalGet, LocalSet,
-        LocalTee, MemArg, Store, StoreKind, Value, VisitorMut,
+        self, BinaryOp, Binop, Const, GlobalGet, GlobalSet, Instr, LocalGet, LocalSet, MemArg,
+        Store, StoreKind, Value, VisitorMut,
     },
     FunctionId, GlobalId, InstrLocId, LocalId, MemoryId, Module, TableId, Type, TypeId, ValType,
 };
@@ -41,6 +41,10 @@ pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
         module_types,
         current_type,
     );
+    // Add return instruction at the end of each function
+    module.funcs.iter_local_mut().for_each(|(_, f)| {
+        f.builder_mut().func_body().return_();
+    });
     module.funcs.iter_local_mut().for_each(|(_, f)| {
         generator.set_current_func_type(module.types.get(f.ty()).clone());
         generator.set_func_entry(true);
@@ -249,9 +253,9 @@ impl VisitorMut for Generator {
                     gen_seq.append(
                         &mut InstructionsEnum::from_vec(vec![
                             self.trace_code(opcode, offset),
-                            // self.save_stack(&[ValType::I32, local_type], offset),
+                            self.save_stack(&[ValType::I32, local_type], offset),
                             self.instr(instr.clone()),
-                            // self.increment_mem_pointer(*offset),
+                            self.increment_mem_pointer(*offset),
                         ])
                         .flatten(),
                     );
@@ -353,12 +357,12 @@ impl VisitorMut for Generator {
                         .flatten(),
                     );
                 }
-                Instr::TableGrow(_) => todo!(),
-                Instr::TableFill(_) => todo!(),
-                Instr::LoadSimd(_) => todo!(),
-                Instr::TableInit(_) => todo!(),
-                Instr::ElemDrop(_) => todo!(),
-                Instr::TableCopy(_) => todo!(),
+                // Instr::TableGrow(_) => todo!(),
+                // Instr::TableFill(_) => todo!(),
+                // Instr::LoadSimd(_) => todo!(),
+                // Instr::TableInit(_) => todo!(),
+                // Instr::ElemDrop(_) => todo!(),
+                // Instr::TableCopy(_) => todo!(),
                 Instr::Return(_) => {
                     let opcode = 0x0F;
                     let c = self.current_func_type.clone();
@@ -367,17 +371,17 @@ impl VisitorMut for Generator {
                         &mut InstructionsEnum::from_vec(vec![
                             self.trace_code(opcode, offset),
                             self.save_stack(returns, offset),
-                            self.instr(instr.clone()),
                             self.increment_mem_pointer(*offset),
+                            self.instr(instr.clone()),
                         ])
                         .flatten(),
                     );
                 }
-                Instr::MemoryGrow(_) => todo!(),
-                Instr::MemoryInit(_) => todo!(),
-                Instr::DataDrop(_) => todo!(),
-                Instr::MemoryCopy(_) => todo!(),
-                Instr::MemoryFill(_) => todo!(),
+                // Instr::MemoryGrow(_) => todo!(),
+                // Instr::MemoryInit(_) => todo!(),
+                // Instr::DataDrop(_) => todo!(),
+                // Instr::MemoryCopy(_) => todo!(),
+                // Instr::MemoryFill(_) => todo!(),
                 _ => return,
             };
             let gen_length = gen_seq.len() - 1;
@@ -552,9 +556,9 @@ impl Generator {
         ))
     }
 
-    fn local_tee(&self, local: LocalId) -> InstructionsEnum {
-        InstructionsEnum::Single((Instr::LocalTee(LocalTee { local }), InstrLocId::default()))
-    }
+    // fn local_tee(&self, local: LocalId) -> InstructionsEnum {
+    //     InstructionsEnum::Single((Instr::LocalTee(LocalTee { local }), InstrLocId::default()))
+    // }
 
     fn local_get(&self, local: LocalId) -> InstructionsEnum {
         InstructionsEnum::Single((Instr::LocalGet(LocalGet { local }), InstrLocId::default()))
