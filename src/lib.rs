@@ -29,6 +29,7 @@ pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
         true,
         walrus::InitExpr::Value(walrus::ir::Value::I32(0)),
     );
+    module.exports.add("trace_byte_length", mem_pointer);
     let locals = add_locals(&mut module);
     let module_types = Types::new(&module);
     let current_type = module
