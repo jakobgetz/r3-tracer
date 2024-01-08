@@ -23,6 +23,7 @@ pub fn instrument_wasm_js(buffer: &[u8]) -> Result<JsValue, JsValue> {
 pub fn instrument_wasm(buffer: &[u8]) -> Result<Module> {
     let mut module = Module::from_buffer(buffer)?;
     let trace_mem_id = module.memories.add_local(false, 30000, None); // around 2 GB
+    module.exports.add("trace", trace_mem_id);
     let mem_pointer = module.globals.add_local(
         walrus::ValType::I32,
         true,
@@ -436,6 +437,8 @@ impl Generator {
             // self.binop(BinaryOp::I32Eq),
             // self.check_mem_test_and_call(),
             self.call_check_mem(),
+            self.get_const(Value::I32(0)),
+            self.global_set(self.mem_pointer)
         ])
     }
 
